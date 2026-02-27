@@ -4,7 +4,7 @@
 
 **StarVLA** is a modular, open-source framework for developing **Vision-Language-Action (VLA)** models — neural networks that take camera images and natural language instructions as input and predict robot actions as output. It follows a "Lego-like" plug-and-play design where each component (VLM backbone, action head, dataloader, trainer) can be swapped independently.
 
-The repository implements **4 distinct VLA architectures**, all built on top of the **Qwen2.5-VL-3B** vision-language model as the shared backbone. They differ in *how they decode actions* from the VLM's representations.
+The repository implements **8 distinct VLA architectures**, all built on top of the **Qwen2.5-VL-3B** vision-language model as the shared backbone. They differ in *how they decode actions* from the VLM's representations. Four are the primary variants (OFT, FAST, GR00T, PI), and four are advanced/experimental (Dual, Adapter, M1, LangForce).
 
 ---
 
@@ -78,7 +78,7 @@ Each training example is a dictionary:
 
 ---
 
-## The 4 VLA Architectures
+## The 4 Primary VLA Architectures
 
 ### 1. Qwen-OFT (Parallel MLP Regression)
 
@@ -230,18 +230,104 @@ Images + Instruction
 
 ---
 
-## Comparison Table
+---
 
-| Feature | Qwen-OFT | Qwen-FAST | Qwen-GR00T | Qwen-PI |
-|---------|----------|-----------|------------|---------|
-| **Action Type** | Continuous | Discrete tokens | Continuous | Continuous |
-| **Action Head** | MLP ResNet | None (VLM head) | DiT + Flow Matching | Layerwise DiT + FM |
-| **Loss** | L1 regression | Cross-entropy (NTP) | Flow matching | Flow matching |
-| **VLM Layers Used** | Last only | N/A (logits) | Last only | Multiple layers |
-| **Inference** | Single forward | Autoregressive gen | Iterative denoising | Iterative denoising |
-| **Decoding** | Parallel | Sequential | Parallel | Parallel |
-| **Extra Params** | Small MLP | Zero (reuses VLM) | Large DiT | Large DiT |
-| **Speed** | Fast | Medium | Medium | Slower |
+## 4 Advanced/Experimental Architectures
+
+### 5. Qwen-Dual (Dual Encoder: Qwen VL + DINOv2)
+
+**File:** `starVLA/model/framework/QwenDual.py`
+**Registry name:** `"QwenDual"`
+
+**How it works:**
+Extends GR00T by adding a **DINOv2** vision encoder alongside the VLM. The DINOv2 features provide dense spatial tokens that complement the VLM's semantic understanding.
+
+1. Run Qwen2.5-VL to get hidden states at a configurable layer
+2. Process images (or separate wrist camera views) through DINOv2
+3. Project DINO features to VLM hidden size via a linear layer
+4. **Concatenate** VLM + DINO features along the sequence dimension → `[B, L_vlm + L_dino, H]`
+5. This combined tensor conditions the same Flow Matching action head as GR00T
+
+**Key difference:** Adds dense spatial features from a frozen DINOv2 encoder. Supports separate wrist-camera views for manipulation tasks.
+
+---
+
+### 6. Qwen-Adapter (Learnable Action Queries + Deep MLP)
+
+**File:** `starVLA/model/framework/QwenAdapter.py`
+**Registry name:** `"QwenAdapter"`
+
+**How it works:**
+The most architecturally complex variant. Uses **learnable action query tokens** injected directly into the VLM's embedding space via forward hooks, and a **deep 24-block MLP ResNet** action head with per-layer cross-attention.
+
+1. Insert `action_query_num` (default 64) dummy action tokens into the instruction
+2. Register a **forward hook** on the VLM embedding layer to replace dummy embeddings with learnable `action_query` parameters
+3. Run VLM, extract **all hidden layers**
+4. For each layer, extract vision features (image positions) and action query features (action token positions)
+5. Stack into `[B, num_layers, L, H]` and feed through the 24-block MLP ResNet
+6. Each block does **multi-head cross-attention** to the corresponding VLM layer's vision + action query features, then residual MLP
+7. L1 loss
+
+**Key difference:** Injects learnable queries into the VLM via embedding hooks (not special tokens). The 24-block deep action head with per-layer cross-attention is far larger than OFT's 2-block MLP.
+
+---
+
+### 7. InternVLA-M1 (Full Pipeline: QFormer + DINO + DiT Diffusion)
+
+**File:** `starVLA/model/framework/M1.py`
+**Registry name:** `"InternVLA-M1"`
+
+**How it works:**
+The original/fullest architecture. Combines Qwen VL + DINOv2 + a **Q-Former bottleneck** for multi-layer feature aggregation + traditional **DDPM/DDIM diffusion** (not flow matching).
+
+1. Run VLM with `output_hidden_states=True`
+2. Run DINOv2, project to VLM hidden size
+3. For each layer in `[start_layer, end_layer]`, concatenate VLM + DINO features
+4. Pass through **layer-wise Q-Former** → `[B, 64, D_action]` action condition embeddings
+5. DDPM forward: add noise at random timestep, predict noise with DiT conditioned on QFormer output
+6. MSE loss on noise prediction
+7. At inference: DDIM sampling with configurable steps and **classifier-free guidance** (CFG)
+
+**Key difference:** Uses traditional DDPM/DDIM diffusion, a Q-Former bottleneck, and supports classifier-free guidance. Most parameter-heavy variant.
+
+---
+
+### 8. LangForce (Bayesian Dual-Branch with Language LLR Regularization)
+
+**File:** `starVLA/model/framework/LangForce.py`
+**Registry name:** `"LangForce"`
+
+**How it works:**
+Implements a Bayesian decomposition with two branches that differ in **input ordering**:
+
+- **Prior branch:** `[Vision + ActionQuery + Language]` — sees action queries before language, forming a vision-conditioned prior p(a|v)
+- **Posterior branch:** `[Vision + Language + ActionQuery]` — standard order, forming the policy pi(a|v,l)
+
+Both branches use the same VLM + Flow Matching head. A **Language Log-Likelihood Ratio (LLR)** regularizer encourages the prior's action queries to encode information useful for predicting the instruction:
+
+```
+LLR = log p(L|V, A_prior) - log p(L|V)
+Total Loss = (1 - w) * posterior_loss + w * prior_loss - kl_weight * LLR
+```
+
+Features hard-token LLR (top-k hardest tokens only) and an adaptive shortcut gate.
+
+**Key difference:** Only framework with a dual-branch design and information-theoretic regularizer. Based on arXiv 2601.15197. Only the posterior branch is used at inference time.
+
+---
+
+## Full Comparison Table
+
+| Framework | Action Head | Action Repr. | VLM Layers | Extra Encoders | Inference | Loss |
+|-----------|------------|-------------|-----------|----------------|-----------|------|
+| **OFT** | MLP ResNet (2 blocks) | Continuous | Last | None | Single forward | L1 |
+| **FAST** | None (VLM head) | Discrete tokens | All (autoregressive) | None | Token generation | Cross-entropy |
+| **GR00T** | DiT + Flow Matching | Continuous | Last | None | Euler integration | Flow matching |
+| **PI** | Layerwise DiT + FM | Continuous | Last N (per-block) | None | Euler integration | Flow matching |
+| **Dual** | DiT + Flow Matching | Continuous | Configurable | DINOv2 | Euler integration | Flow matching |
+| **Adapter** | Deep MLP (24 blocks) + cross-attn | Continuous | All layers | None | Single forward | L1 |
+| **M1** | DiT + DDPM diffusion | Continuous | Layer range | DINOv2 + QFormer | DDIM sampling + CFG | MSE (noise) |
+| **LangForce** | DiT + FM (x2 branches) | Continuous | Last | None | Euler (posterior) | FM + LLR |
 
 ---
 
@@ -263,7 +349,7 @@ All frameworks use `_QWen_VL_Interface`, a wrapper around `Qwen2_5_VLForConditio
 
 **File:** `starVLA/model/framework/base_framework.py`
 
-All 4 architectures inherit from `baseframework(PreTrainedModel)`:
+All 8 architectures inherit from `baseframework(PreTrainedModel)`:
 - `from_pretrained()` — loads config, normalization stats, and weights from a checkpoint
 - `unnormalize_actions()` — maps normalized actions ([-1,1]) back to original scale using q01/q99 percentile statistics
 - `trainable_module_keys` — auto-discovers which submodules have trainable parameters
@@ -339,6 +425,10 @@ StarVLA provides a clean abstraction for VLA research. The key insight is that a
 - **OFT**: Simplest — just regress actions from hidden states via MLP
 - **FAST**: Reuses the VLM's own language modeling — zero extra parameters
 - **GR00T**: Powerful diffusion-based decoding with cross-attention to VLM features
-- **PI**: Most expressive — layerwise cross-attention gives the action head multi-scale VLM features
+- **PI**: Most expressive primary variant — layerwise cross-attention gives the action head multi-scale VLM features
+- **Dual**: Adds DINOv2 spatial features on top of GR00T
+- **Adapter**: Deep action head with learnable query injection and per-layer cross-attention
+- **M1**: Full pipeline with QFormer bottleneck, DINOv2, and traditional DDPM diffusion with CFG
+- **LangForce**: Bayesian dual-branch with language-grounded regularization
 
 All share the same data pipeline, training infrastructure, and deployment tooling.
